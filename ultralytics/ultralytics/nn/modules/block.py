@@ -1625,7 +1625,9 @@ class SparseRouterNeck(nn.Module):
         self.p5_to_p4 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), Conv(c5, c4, 1))
 
         self.gates = nn.Parameter(torch.zeros(4))
-        self._sparse_loss = torch.zeros(1)
+        # Keep a detached diagnostic value only. Do not store graph tensors on module state,
+        # otherwise deepcopy(ModelEMA) can fail on newer PyTorch versions.
+        self.register_buffer("_sparse_loss", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def _sample_gate(self, logit: torch.Tensor) -> torch.Tensor:
         """Sample straight-through binary gate during training."""
@@ -1646,14 +1648,14 @@ class SparseRouterNeck(nn.Module):
         p3 = p3 + z43 * self.p4_to_p3(p4)
         p5 = p5 + z45 * self.p4_to_p5(p4)
 
-        self._sparse_loss = z34 + z43 + z45 + z54
+        self._sparse_loss = (z34 + z43 + z45 + z54).detach()
         return [p3, p4, p5]
 
     def sparsity_loss(self) -> torch.Tensor:
-        """Return the latest sparsity regularization term."""
-        if not torch.is_tensor(self._sparse_loss):
-            return torch.zeros(1, device=self.gates.device)
-        return self._sparse_loss
+        """Return sparsity regularization with gradients on gate parameters."""
+        if self.training:
+            return torch.sigmoid(self.gates).sum()
+        return self._sparse_loss.to(device=self.gates.device)
 
 
 class C2fPSA(C2f):
