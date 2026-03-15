@@ -25,15 +25,17 @@ backbone:
   - [-1, 2, MAFBlock, [48, 0.5]] # 2
   - [-1, 1, SCDown, [96, 3, 2]] # 3-P3/8
   - [-1, 2, MAFBlock, [96, 0.5]] # 4
-  - [-1, 1, SCDown, [160, 3, 2]] # 5-P4/16
-  - [-1, 2, MAFBlock, [160, 0.5]] # 6
-  - [-1, 1, SPPF, [160, 5]] # 7
-  - [-1, 1, MAFBlock, [160, 0.5]] # 8
+  # Deep stage is intentionally trimmed because VisDrone benefits more from preserving P2/P3 detail
+  # than from a wide P4 branch. This keeps the charter aligned with "lighter than YOLO26n".
+  - [-1, 1, SCDown, [144, 3, 2]] # 5-P4/16
+  - [-1, 1, MAFBlock, [144, 0.5]] # 6
+  - [-1, 1, SPPF, [144, 5]] # 7
+  - [-1, 1, MAFBlock, [144, 0.5]] # 8
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [96, 0.5]] # 11
+  - [-1, 1, MAFBlock, [96, 0.5]] # 11
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 2], 1, Concat, [1]]
@@ -41,10 +43,10 @@ head:
 
   - [-1, 1, SCDown, [96, 3, 2]]
   - [[-1, 11], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [96, 0.5]] # 17 (P3/8)
+  - [-1, 1, MAFBlock, [96, 0.5]] # 17 (P3/8)
 
-  - [-1, 1, SCDown, [160, 3, 2]]
+  - [-1, 1, SCDown, [144, 3, 2]]
   - [[-1, 8], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [160, 0.5]] # 20 (P4/16)
+  - [-1, 1, MAFBlock, [144, 0.5]] # 20 (P4/16)
 
   - [[14, 17, 20], 1, Detect, [nc]] # Detect(P2, P3, P4)

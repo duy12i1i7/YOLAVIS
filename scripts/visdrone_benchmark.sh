@@ -7,6 +7,7 @@ Usage:
   visdrone_benchmark.sh train <variant>
   visdrone_benchmark.sh val <variant>
   visdrone_benchmark.sh resume <variant>
+  visdrone_benchmark.sh summarize <variant>
 
 Variants:
   yolo26n
@@ -75,25 +76,32 @@ esac
 
 batch="${BATCH:-$batch_default}"
 weights="${project}/${run_name}/weights"
+run_dir="${project}/${run_name}"
 
 case "$mode" in
   train)
+    mkdir -p "${run_dir}"
     yolo detect train \
       model="${model}" \
       data="${data}" \
       epochs="${epochs}" time="${time_hours}" imgsz="${imgsz}" \
       batch="${batch}" workers="${workers}" device="${device}" \
-      project="${project}" name="${run_name}"
+      project="${project}" name="${run_name}" 2>&1 | tee "${run_dir}/train.log"
     ;;
   val)
+    mkdir -p "${run_dir}"
     yolo detect val \
       model="${weights}/best.pt" \
-      data="${data}" split=val imgsz="${imgsz}" device="${device}"
+      data="${data}" split=val imgsz="${imgsz}" device="${device}" 2>&1 | tee "${run_dir}/val.log"
     ;;
   resume)
+    mkdir -p "${run_dir}"
     yolo detect train resume \
       model="${weights}/last.pt" \
-      device="${device}" time="${time_hours}"
+      device="${device}" time="${time_hours}" 2>&1 | tee -a "${run_dir}/train.log"
+    ;;
+  summarize)
+    python3 "${repo_root}/scripts/summarize_visdrone.py" "${run_dir}"
     ;;
   *)
     echo "Unknown mode: ${mode}" >&2

@@ -13,15 +13,15 @@ backbone:
   - [-1, 2, MAFBlock, [48, 0.5]]
   - [-1, 1, SCDown, [96, 3, 2]]
   - [-1, 2, MAFBlock, [96, 0.5]]
-  - [-1, 1, SCDown, [160, 3, 2]]
-  - [-1, 2, MAFBlock, [160, 0.5]]
-  - [-1, 1, SPPF, [160, 5]]
-  - [-1, 1, MAFBlock, [160, 0.5]]
+  - [-1, 1, SCDown, [144, 3, 2]]
+  - [-1, 1, MAFBlock, [144, 0.5]]
+  - [-1, 1, SPPF, [144, 5]]
+  - [-1, 1, MAFBlock, [144, 0.5]]
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [96, 0.5]]
+  - [-1, 1, MAFBlock, [96, 0.5]]
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 2], 1, Concat, [1]]
@@ -29,10 +29,10 @@ head:
 
   - [-1, 1, SCDown, [96, 3, 2]]
   - [[-1, 11], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [96, 0.5]]
+  - [-1, 1, MAFBlock, [96, 0.5]]
 
-  - [-1, 1, SCDown, [160, 3, 2]]
+  - [-1, 1, SCDown, [144, 3, 2]]
   - [[-1, 8], 1, Concat, [1]]
-  - [-1, 2, MAFBlock, [160, 0.5]]
+  - [-1, 1, MAFBlock, [144, 0.5]]
 
   - [[14, 17, 20], 1, Detect, [nc]]

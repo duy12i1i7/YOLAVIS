@@ -11,6 +11,21 @@ Shortcut script from repo root:
 ./scripts/visdrone_benchmark.sh train featherdet-noarea
 ```
 
+Summaries after each run:
+
+```bash
+./scripts/visdrone_benchmark.sh summarize yolo26n
+./scripts/visdrone_benchmark.sh summarize yolo26p2
+./scripts/visdrone_benchmark.sh summarize featherdet
+./scripts/visdrone_benchmark.sh summarize featherdet-noarea
+```
+
+Record all numbers in:
+
+```bash
+/kaggle/working/YOLAVIS/VISDRONE_SCORECARD.md
+```
+
 ## 1. Baseline: YOLO26n
 
 ```bash
