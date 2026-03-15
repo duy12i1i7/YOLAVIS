@@ -16,10 +16,8 @@ from ultralytics.nn.modules import (
     C1,
     C2,
     C2PSA,
-    C2PSALite,
     C3,
     C3TR,
-    C3SREB,
     ELAN1,
     OBB,
     OBB26,
@@ -47,6 +45,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DPSStem,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -57,6 +56,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MAFBlock,
     Pose,
     Pose26,
     RepC3,
@@ -68,7 +68,6 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
-    SparseRouterNeck,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -79,8 +78,8 @@ from ultralytics.nn.modules import (
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
+    AreaAwareDetectionLoss,
     E2ELoss,
-    NovaE2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
     v8DetectionLoss,
@@ -516,8 +515,8 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         if getattr(self, "end2end", False):
-            return NovaE2ELoss(self) if self.yaml.get("udas", False) else E2ELoss(self)
-        return v8DetectionLoss(self)
+            return E2ELoss(self)
+        return AreaAwareDetectionLoss(self) if self.yaml.get("area_focus", False) else v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1590,14 +1589,12 @@ def parse_model(d, ch, verbose=True):
             SPPF,
             C2fPSA,
             C2PSA,
-            C2PSALite,
             DWConv,
             Focus,
             BottleneckCSP,
             C1,
             C2,
             C2f,
-            C3SREB,
             C3k2,
             RepNCSPELAN4,
             ELAN1,
@@ -1616,6 +1613,8 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            DPSStem,
+            MAFBlock,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1624,7 +1623,6 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
-            C3SREB,
             C3k2,
             C2fAttn,
             C3,
@@ -1635,7 +1633,6 @@ def parse_model(d, ch, verbose=True):
             C2fPSA,
             C2fCIB,
             C2PSA,
-            C2PSALite,
             A2C2f,
         }
     )
@@ -1720,20 +1717,10 @@ def parse_model(d, ch, verbose=True):
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
-        elif m is SparseRouterNeck:
-            if not isinstance(f, list) or len(f) != 3:
-                raise ValueError("SparseRouterNeck expects exactly 3 input feature maps.")
-            args = [ch[f[0]], ch[f[1]], ch[f[2]], *args]
-            c2 = [ch[f[0]], ch[f[1]], ch[f[2]]]
         elif m in frozenset({TorchVision, Index}):
+            c2 = args[0]
             c1 = ch[f]
-            if m is Index and isinstance(c1, list) and len(args) == 1:
-                idx = args[0]
-                c2 = c1[idx]
-                args = [idx]
-            else:
-                c2 = args[0]
-                args = [*args[1:]]
+            args = [*args[1:]]
         else:
             c2 = ch[f]
 

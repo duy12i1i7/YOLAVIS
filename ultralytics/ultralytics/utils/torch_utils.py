@@ -635,23 +635,7 @@ class ModelEMA:
             tau (int, optional): EMA decay time constant.
             updates (int, optional): Initial number of updates.
         """
-        base_model = unwrap_model(model)
-        try:
-            self.ema = deepcopy(base_model).eval()  # FP32 EMA
-        except RuntimeError as e:
-            # Some custom modules may store non-leaf tensors as attributes, which breaks deepcopy on newer PyTorch.
-            # Detach these attributes temporarily so EMA can still be created.
-            if "deepcopy protocol" not in str(e):
-                raise
-            patched = []
-            for module in base_model.modules():
-                for name, value in vars(module).items():
-                    if isinstance(value, torch.Tensor) and not value.is_leaf:
-                        patched.append((module, name, value))
-                        setattr(module, name, value.detach())
-            self.ema = deepcopy(base_model).eval()  # FP32 EMA
-            for module, name, value in patched:
-                setattr(module, name, value)
+        self.ema = deepcopy(unwrap_model(model)).eval()  # FP32 EMA
         self.updates = updates  # number of EMA updates
         self.decay = lambda x: decay * (1 - math.exp(-x / tau))  # decay exponential ramp (to help early epochs)
         for p in self.ema.parameters():

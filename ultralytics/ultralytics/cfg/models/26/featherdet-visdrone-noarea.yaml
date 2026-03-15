@@ -1,0 +1,38 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ablation config: same FeatherDet architecture, area-aware loss disabled.
+
+nc: 80
+end2end: False
+reg_max: 8
+area_focus: False
+
+backbone:
+  - [-1, 1, DPSStem, [24]]
+  - [-1, 1, Conv, [48, 3, 2]]
+  - [-1, 2, MAFBlock, [48, 0.5]]
+  - [-1, 1, SCDown, [96, 3, 2]]
+  - [-1, 2, MAFBlock, [96, 0.5]]
+  - [-1, 1, SCDown, [160, 3, 2]]
+  - [-1, 2, MAFBlock, [160, 0.5]]
+  - [-1, 1, SPPF, [160, 5]]
+  - [-1, 1, MAFBlock, [160, 0.5]]
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, MAFBlock, [96, 0.5]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]]
+  - [-1, 2, MAFBlock, [48, 0.5]]
+
+  - [-1, 1, SCDown, [96, 3, 2]]
+  - [[-1, 11], 1, Concat, [1]]
+  - [-1, 2, MAFBlock, [96, 0.5]]
+
+  - [-1, 1, SCDown, [160, 3, 2]]
+  - [[-1, 8], 1, Concat, [1]]
+  - [-1, 2, MAFBlock, [160, 0.5]]
+
+  - [[14, 17, 20], 1, Detect, [nc]]

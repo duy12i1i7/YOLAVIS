@@ -468,6 +468,87 @@ class v8DetectionLoss:
         return loss * batch_size, loss_detach
 
 
+class AreaAwareDetectionLoss(v8DetectionLoss):
+    """Detection loss that upweights assigned small objects without affecting inference."""
+
+    def __init__(self, model, tal_topk: int = 10, tal_topk2: int | None = None):
+        """Initialize area-aware weighting hyperparameters from model YAML."""
+        super().__init__(model, tal_topk=tal_topk, tal_topk2=tal_topk2)
+        cfg = model.yaml if isinstance(getattr(model, "yaml", None), dict) else {}
+        self.area_gain = float(cfg.get("area_gain", 1.0))
+        self.area_gamma = float(cfg.get("area_gamma", 0.5))
+        self.area_ref = float(cfg.get("area_ref", 0.02))
+        self.area_min = float(cfg.get("area_min", 1.0))
+        self.area_max = float(cfg.get("area_max", 3.0))
+
+    def _area_weight(self, target_bboxes: torch.Tensor, imgsz: torch.Tensor) -> torch.Tensor:
+        """Return a multiplicative weight that emphasizes smaller boxes."""
+        box_area = xyxy2xywh(target_bboxes)[..., 2:].prod(-1, keepdim=True)
+        img_area = (imgsz[0] * imgsz[1]).clamp_min(1.0)
+        norm_area = (box_area / img_area).clamp_min(1e-9)
+        weight = (self.area_ref / norm_area).pow(self.area_gamma)
+        weight = weight.clamp_(self.area_min, self.area_max)
+        return 1.0 + self.area_gain * (weight - 1.0)
+
+    def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
+        """Calculate detection loss with extra weighting for assigned small boxes."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        pred_distri, pred_scores = (
+            preds["boxes"].permute(0, 2, 1).contiguous(),
+            preds["scores"].permute(0, 2, 1).contiguous(),
+        )
+        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+
+        dtype = pred_scores.dtype
+        batch_size = pred_scores.shape[0]
+        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+
+        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+
+        size_weight = torch.ones((*target_scores.shape[:2], 1), device=self.device, dtype=target_scores.dtype)
+        if fg_mask.any():
+            size_weight[fg_mask] = self._area_weight(target_bboxes[fg_mask], imgsz).to(target_scores.dtype)
+        target_scores = target_scores * size_weight
+        target_scores_sum = target_scores.sum().clamp_min(1)
+
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+
+        if fg_mask.sum():
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri,
+                pred_bboxes,
+                anchor_points,
+                target_bboxes / stride_tensor,
+                target_scores,
+                target_scores_sum,
+                fg_mask,
+                imgsz,
+                stride_tensor,
+            )
+
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        return (
+            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
+            loss,
+            loss.detach(),
+        )
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 
@@ -1175,77 +1256,6 @@ class E2ELoss:
     def decay(self, x) -> float:
         """Calculate the decayed weight for one-to-many loss based on the current update step."""
         return max(1 - x / max(self.one2one.hyp.epochs - 1, 1), 0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
-
-
-class NovaE2ELoss(E2ELoss):
-    """E2E loss with uncertainty-aware distillation and sparse-router regularization."""
-
-    def __init__(self, model, loss_fn=v8DetectionLoss):
-        """Initialize NovaE2ELoss.
-
-        Args:
-            model: Detection model instance.
-            loss_fn: Base detection loss function.
-        """
-        super().__init__(model, loss_fn=loss_fn)
-        cfg = model.yaml if isinstance(getattr(model, "yaml", None), dict) else {}
-        self.model = model
-        self.distill_max = float(cfg.get("nova_distill", 0.15))
-        self.distill_warmup = int(cfg.get("nova_distill_warmup", 10))
-        self.uncertainty_thresh = float(cfg.get("nova_uncertainty_thresh", 0.35))
-        self.distill_temp = float(cfg.get("nova_distill_temp", 2.0))
-        self.sparse_weight = float(cfg.get("nova_sparse_weight", 1e-4))
-        self.sparse_warmup = int(cfg.get("nova_sparse_warmup", 5))
-
-    def _warmup_factor(self, warmup_epochs: int) -> float:
-        """Return a linear warmup factor in [0, 1]."""
-        return min((self.updates + 1) / max(warmup_epochs, 1), 1.0)
-
-    def _uncertainty_distill(self, student_scores: torch.Tensor, teacher_scores: torch.Tensor) -> torch.Tensor:
-        """Compute uncertainty-weighted distillation loss on classification logits."""
-        t = self.distill_temp
-        teacher_prob = torch.sigmoid(teacher_scores.detach() / t)
-        student_logits = student_scores / t
-
-        # High-uncertainty anchors are close to 0.5 probability.
-        uncertainty = 1.0 - (teacher_prob - 0.5).abs() * 2.0
-        mask = (uncertainty > self.uncertainty_thresh).to(student_logits.dtype)
-
-        distill_map = F.binary_cross_entropy_with_logits(student_logits, teacher_prob, reduction="none")
-        denom = mask.sum().clamp_min(1.0)
-        return (distill_map * mask * uncertainty).sum() / denom * (t**2)
-
-    def _sparse_penalty(self, device: torch.device) -> torch.Tensor:
-        """Aggregate sparsity penalties from sparse router modules."""
-        penalties = []
-        for module in self.model.model.modules():
-            if hasattr(module, "sparsity_loss"):
-                penalty = module.sparsity_loss()
-                if penalty is None:
-                    continue
-                if not torch.is_tensor(penalty):
-                    penalty = torch.tensor(float(penalty), device=device)
-                else:
-                    penalty = penalty.to(device=device)
-                penalties.append(penalty.reshape(()))
-        return torch.stack(penalties).sum() if penalties else torch.zeros((), device=device)
-
-    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate Nova E2E loss."""
-        preds = self.one2many.parse_output(preds)
-        one2many, one2one = preds["one2many"], preds["one2one"]
-        loss_one2many = self.one2many.loss(one2many, batch)
-        loss_one2one = self.one2one.loss(one2one, batch)
-
-        base = loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o
-
-        distill = self._uncertainty_distill(one2one["scores"], one2many["scores"])
-        distill *= self.distill_max * self._warmup_factor(self.distill_warmup)
-
-        sparse = self._sparse_penalty(device=self.one2one.device)
-        sparse *= self.sparse_weight * self._warmup_factor(self.sparse_warmup)
-
-        return base + distill + sparse, loss_one2one[1]
 
 
 class TVPDetectLoss:

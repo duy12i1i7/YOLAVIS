@@ -35,25 +35,24 @@ __all__ = (
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
-    "C2PSALite",
     "C3Ghost",
-    "C3SREB",
     "C3k2",
     "C3x",
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "DPSStem",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "MAFBlock",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
-    "SparseRouterNeck",
     "TorchVision",
 )
 
@@ -1109,62 +1108,54 @@ class C3k2(C2f):
         )
 
 
-class SREBlock(nn.Module):
-    """Sparse Re-parameterized Elastic block.
+class DPSStem(nn.Module):
+    """Detail-preserving shuffle stem for tiny-object-heavy scenes."""
 
-    Uses a gated multi-branch residual path during training and remains export-friendly.
-    """
-
-    def __init__(self, c: int, e: float = 1.0, tau: float = 1.0, shortcut: bool = True):
-        """Initialize SREBlock.
-
-        Args:
-            c (int): Input/output channels.
-            e (float): Hidden expansion ratio.
-            tau (float): Softmax temperature for branch routing.
-            shortcut (bool): Whether to use residual addition.
-        """
+    def __init__(self, c1: int, c2: int):
+        """Initialize the stem with pixel unshuffle followed by lightweight fusion."""
         super().__init__()
-        c_ = max(int(c * e), 8)
-        self.tau = tau
-        self.shortcut = shortcut
-
-        self.b1 = nn.Sequential(DWConv(c, c, 3), Conv(c, c_, 1), Conv(c_, c, 1, act=False))
-        self.b2 = nn.Sequential(DWConv(c, c, 5), Conv(c, c_, 1), Conv(c_, c, 1, act=False))
-        self.b3 = Conv(c, c, 1, act=False)
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c, max(c // 4, 8), 1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(max(c // 4, 8), 3, 1),
-        )
-        self.act = nn.SiLU(inplace=True)
+        c_ = max(c2 // 2, 8)
+        self.reorg = nn.PixelUnshuffle(2)
+        self.cv1 = Conv(c1 * 4, c_, 1, 1)
+        self.dw = DWConv(c_, c_, 3, 1)
+        self.cv2 = Conv(c_, c2, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through SREBlock."""
-        logits = self.gate(x).flatten(1)
-        gates = F.softmax(logits / self.tau, dim=1)
-        y1, y2, y3 = self.b1(x), self.b2(x), self.b3(x)
-        y = gates[:, 0, None, None, None] * y1 + gates[:, 1, None, None, None] * y2 + gates[:, 2, None, None, None] * y3
-        return self.act(x + y) if self.shortcut else self.act(y)
+        """Preserve fine-grained detail before the first aggressive downsample."""
+        return self.cv2(self.dw(self.cv1(self.reorg(x))))
 
 
-class C3SREB(C2f):
-    """C2f-style block using SREBlock units."""
+class MAFBlock(nn.Module):
+    """Micro-aware fusion block mixing local detail, wider context, and contrast cues."""
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, tau: float = 1.0, shortcut: bool = True):
-        """Initialize C3SREB.
+    def __init__(self, c1: int, c2: int, e: float = 0.5, shortcut: bool = True):
+        """Initialize the block."""
+        super().__init__()
+        c_ = max(int(c2 * e), 8)
+        g_ = max(c_ // 2, 8)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.local = nn.Sequential(DWConv(c_, c_, 3, 1), Conv(c_, c_, 1, 1, act=False))
+        self.context = nn.Sequential(DWConv(c_, c_, 5, 1), Conv(c_, c_, 1, 1, act=False))
+        self.contrast = nn.Sequential(nn.MaxPool2d(3, 1, 1), Conv(c_, c_, 1, 1, act=False))
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_, g_, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(g_, c_ * 3, 1),
+            nn.Sigmoid(),
+        )
+        self.cv2 = Conv(c_ * 3, c2, 1, 1)
+        self.add = shortcut and c1 == c2
 
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of SREBlock units.
-            e (float): Expansion ratio.
-            tau (float): Gate temperature.
-            shortcut (bool): Whether to use shortcuts inside SREBlock.
-        """
-        super().__init__(c1, c2, n, shortcut, 1, e)
-        self.m = nn.ModuleList(SREBlock(self.c, e=1.0, tau=tau, shortcut=shortcut) for _ in range(n))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fuse complementary tiny-object cues with a cheap channel gate."""
+        y = self.cv1(x)
+        local = self.local(y)
+        context = self.context(y)
+        contrast = self.contrast(y) - y
+        g_local, g_context, g_contrast = self.gate(y).chunk(3, 1)
+        out = self.cv2(torch.cat((local * g_local, context * g_context, contrast * g_contrast), 1))
+        return x + out if self.add else out
 
 
 class C3k(C3):
@@ -1547,115 +1538,6 @@ class C2PSA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
-
-
-class LitePSABlock(nn.Module):
-    """Lightweight PSA block with grouped FFN for lower compute."""
-
-    def __init__(self, c: int, attn_ratio: float = 0.25, num_heads: int = 1, groups: int = 4):
-        """Initialize LitePSABlock.
-
-        Args:
-            c (int): Input and output channels.
-            attn_ratio (float): Key ratio for attention.
-            num_heads (int): Number of attention heads.
-            groups (int): Groups used in FFN pointwise convolutions.
-        """
-        super().__init__()
-        g = min(max(groups, 1), c)
-        while c % g:
-            g -= 1
-        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=max(num_heads, 1))
-        self.ffn = nn.Sequential(Conv(c, c * 2, 1, g=g), Conv(c * 2, c, 1, g=g, act=False))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through LitePSABlock."""
-        x = x + self.attn(x)
-        x = x + self.ffn(x)
-        return x
-
-
-class C2PSALite(nn.Module):
-    """Lighter version of C2PSA using lower-ratio attention and grouped FFN."""
-
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn_ratio: float = 0.25, groups: int = 4):
-        """Initialize C2PSALite module.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of LitePSABlock modules.
-            e (float): Expansion ratio.
-            attn_ratio (float): Key ratio for attention.
-            groups (int): FFN group count.
-        """
-        super().__init__()
-        assert c1 == c2
-        self.c = int(c1 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
-        heads = max(self.c // 128, 1)
-        self.m = nn.Sequential(*(LitePSABlock(self.c, attn_ratio=attn_ratio, num_heads=heads, groups=groups) for _ in range(n)))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Process input tensor with lightweight PSA stack."""
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)
-        b = self.m(b)
-        return self.cv2(torch.cat((a, b), 1))
-
-
-class SparseRouterNeck(nn.Module):
-    """Sparse cross-scale router for P3/P4/P5 feature maps."""
-
-    def __init__(self, c3: int, c4: int, c5: int, temperature: float = 2.0):
-        """Initialize SparseRouterNeck.
-
-        Args:
-            c3 (int): P3 channels.
-            c4 (int): P4 channels.
-            c5 (int): P5 channels.
-            temperature (float): Gate temperature for straight-through sampling.
-        """
-        super().__init__()
-        self.temperature = temperature
-
-        self.p3_to_p4 = nn.Sequential(Conv(c3, c4, 3, 2), Conv(c4, c4, 1))
-        self.p4_to_p3 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), Conv(c4, c3, 1))
-        self.p4_to_p5 = nn.Sequential(Conv(c4, c5, 3, 2), Conv(c5, c5, 1))
-        self.p5_to_p4 = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), Conv(c5, c4, 1))
-
-        self.gates = nn.Parameter(torch.zeros(4))
-        # Keep a detached diagnostic value only. Do not store graph tensors on module state,
-        # otherwise deepcopy(ModelEMA) can fail on newer PyTorch versions.
-        self.register_buffer("_sparse_loss", torch.zeros((), dtype=torch.float32), persistent=False)
-
-    def _sample_gate(self, logit: torch.Tensor) -> torch.Tensor:
-        """Sample straight-through binary gate during training."""
-        if self.training:
-            u = torch.rand_like(logit).clamp_(1e-6, 1 - 1e-6)
-            s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + logit) / self.temperature)
-        else:
-            s = torch.sigmoid(logit)
-        h = (s > 0.5).float()
-        return h.detach() - s.detach() + s
-
-    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Route and fuse 3-scale input features with sparse learnable edges."""
-        p3, p4, p5 = x
-        z34, z43, z45, z54 = [self._sample_gate(g) for g in self.gates]
-
-        p4 = p4 + z34 * self.p3_to_p4(p3) + z54 * self.p5_to_p4(p5)
-        p3 = p3 + z43 * self.p4_to_p3(p4)
-        p5 = p5 + z45 * self.p4_to_p5(p4)
-
-        self._sparse_loss = (z34 + z43 + z45 + z54).detach()
-        return [p3, p4, p5]
-
-    def sparsity_loss(self) -> torch.Tensor:
-        """Return sparsity regularization with gradients on gate parameters."""
-        if self.training:
-            return torch.sigmoid(self.gates).sum()
-        return self._sparse_loss.to(device=self.gates.device)
 
 
 class C2fPSA(C2f):
